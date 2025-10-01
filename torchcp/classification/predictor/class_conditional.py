@@ -83,7 +83,7 @@ class XGBoostClassConditionalPredictor(ClassConditionalPredictor):
         # Temperature Scaling is applied to logits (or in case of XGBoost, probabilities converted to logits)
         self._logits_transformation = ConfCalibrator.registry_ConfCalibrator("TS")(temperature).to(self._device)
 
-    def calibrate(self, cal_dataloader, fsc_group_index=None, alpha=None):
+    def calibrate(self, cal_dataloader, group_dataloader, alpha=None):
         """
         Calibrates the predictor using the calibration dataset with an XGBoost model.
 
@@ -107,13 +107,10 @@ class XGBoostClassConditionalPredictor(ClassConditionalPredictor):
 
         # Iterate through the dataloader to get calibration data
         with torch.no_grad(): # Still useful for any potential tensor operations
-            for examples in cal_dataloader:
+            for examples, groups in zip(cal_dataloader, group_dataloader):
                 # Assuming examples[0] is features and examples[1] is labels
                 tmp_x_tensor = examples[0]
-                if fsc_group_index is None:
-                    tmp_labels_tensor = examples[1]
-                else:
-                    tmp_labels_tensor = examples[0, :, fsc_group_index]
+                tmp_labels_tensor = groups
 
                 # Convert tensors to numpy arrays for XGBoost prediction
                 tmp_x_np = tmp_x_tensor.cpu().numpy()

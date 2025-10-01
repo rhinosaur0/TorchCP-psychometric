@@ -337,7 +337,7 @@ class XGBoostWeightedPredictor(SplitPredictor):
         # Store calibration set size for computing group densities
         self.cal_size = len(self.cal_scores)
 
-    def evaluate(self, val_dataloader: DataLoader, group_index: int) -> Dict[str, float]:
+    def evaluate(self, val_dataloader: DataLoader, group_dataloader: DataLoader) -> Dict[str, float]:
         """
         Evaluate prediction sets on validation dataset using group-based weighted conformal prediction.
 
@@ -362,12 +362,12 @@ class XGBoostWeightedPredictor(SplitPredictor):
         val_features_list = []
         val_labels_list = []
         val_group_labels_list = []
-        
-        for batch in val_dataloader:
+
+        for batch, groups in zip(val_dataloader, group_dataloader):
             val_features_list.append(batch[0])
             val_labels_list.append(batch[1])
-            val_group_labels_list.append(batch[0][:, group_index])
-        
+            val_group_labels_list.append(groups)
+
         val_features = torch.cat(val_features_list, dim=0)
         val_labels = torch.cat(val_labels_list, dim=0)
         val_group_labels = torch.cat(val_group_labels_list, dim=0).cpu().numpy()
