@@ -5,8 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 #
 
-from .class_conditional import ClassConditionalPredictor
+from .class_conditional import ClassConditionalPredictor, XGBoostClassConditionalPredictor
 from .cluster import ClusteredPredictor
 from .split import SplitPredictor
-from .weight import WeightedPredictor
+from .weight import WeightedPredictor, XGBoostWeightedPredictor
 from .rc3p import RC3PPredictor

@@ -14,6 +14,8 @@ from torch.utils.data import DataLoader
 
 from torchcp.classification.predictor.split import SplitPredictor
 from torchcp.classification.predictor.utils import build_DomainDetecor, IW
+from torchcp.classification.utils import ConfCalibrator
+from torchcp.classification.utils.metrics import Metrics
 
 
 class WeightedPredictor(SplitPredictor):
@@ -227,3 +229,211 @@ class WeightedPredictor(SplitPredictor):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+
+
+class XGBoostWeightedPredictor(SplitPredictor):
+    """
+    XGBoost version of Weighted Conformal Prediction
+    Method: Weighted Conformal Prediction
+    Paper: Conformal Prediction Under Covariate Shift (Tibshirani et al., 2019)
+    
+    Args:
+        score_function (callable): Non-conformity score function.
+        model: XGBoost model.
+        temperature (float, optional): The temperature of Temperature Scaling. Default is 1.
+        alpha (float, optional): The significance level. Default is 0.1.
+        device (torch.device, optional): The device for tensor operations. Default is None.
+        domain_classifier: Pre-trained domain classifier for computing importance weights.
+    """
+
+    def __init__(self, score_function, model, temperature=1, alpha=0.1, device=None, domain_classifier=None):
+        if temperature <= 0:
+            raise ValueError("temperature must be greater than 0.")
+
+        self.score_function = score_function
+        self._model = model  # XGBoost model
+
+        if not (0 < alpha < 1):
+            raise ValueError("alpha should be a value in (0, 1).")
+        self.alpha = alpha
+
+        # For XGBoost, device is less relevant for the model itself,
+        # but we keep it for tensor operations later.
+        if device is not None:
+            self._device = torch.device(device)
+        else:
+            self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self._metric = Metrics()
+        # Temperature Scaling applied to probabilities converted to logits
+        self._logits_transformation = ConfCalibrator.registry_ConfCalibrator("TS")(temperature).to(self._device)
+        
+        # Domain classifier for importance weighting
+        if domain_classifier is None:
+            raise ValueError("domain_classifier cannot be None for weighted prediction.")
+        self.domain_classifier = domain_classifier
+        self.IW = IW(self.domain_classifier).to(self._device)
+        
+        # Store calibration features and weights
+        self.source_features = None
+        self.w_sorted = None
+        self.scores_sorted = None
+
+    def calibrate(self, cal_dataloader, group_index, alpha=None):
+        """
+        Calibrate the model using the calibration set with importance weighting.
+
+        Args:
+            cal_dataloader (torch.utils.data.DataLoader): A dataloader of the calibration set.
+            group_index (int): The index of the group label feature in the input.
+            alpha (float): The significance level. Default is None.
+        """
+        if alpha is None:
+            alpha = self.alpha
+
+        if self._model is None:
+            raise ValueError("Model is not defined. Please provide a valid model.")
+
+        self.alpha = alpha
+        logits_list = []
+        labels_list = []
+        group_labels_list = []
+
+        # Iterate through calibration dataloader
+        with torch.no_grad():
+            for cal_batch in cal_dataloader:
+                # Get features and labels from calibration set
+                tmp_x_tensor = cal_batch[0]
+                tmp_labels_tensor = cal_batch[1]
+
+                # Extract group labels
+                group_labels = tmp_x_tensor[:, group_index]
+                group_labels_list.append(group_labels)
+
+                # Convert tensors to numpy arrays for XGBoost prediction
+                tmp_x_np = tmp_x_tensor.cpu().numpy()
+                tmp_labels_np = tmp_labels_tensor.cpu().numpy()
+
+                # Get prediction probabilities from XGBoost model
+                tmp_proba_np = self._model.predict_proba(tmp_x_np)
+
+                # Convert probabilities back to tensors and move to the correct device
+                tmp_logits = torch.tensor(tmp_proba_np, dtype=torch.float32).to(self._device)
+                tmp_labels = torch.tensor(tmp_labels_np, dtype=torch.long).to(self._device)
+
+                # Apply temperature scaling
+                tmp_calibrated_logits = self._logits_transformation(tmp_logits).detach()
+
+                logits_list.append(tmp_calibrated_logits)
+                labels_list.append(tmp_labels)
+
+            logits = torch.cat(logits_list).float()
+            labels = torch.cat(labels_list)
+            self.cal_group_labels = torch.cat(group_labels_list).cpu().numpy()
+
+        # Compute non-conformity scores for calibration set
+        self.cal_scores = self.score_function(logits, labels).cpu().numpy()
+        
+        # Store calibration set size for computing group densities
+        self.cal_size = len(self.cal_scores)
+
+    def evaluate(self, val_dataloader: DataLoader, group_index: int) -> Dict[str, float]:
+        """
+        Evaluate prediction sets on validation dataset using group-based weighted conformal prediction.
+
+        This method computes group-specific importance weights for validation set, generates prediction sets 
+        using weighted quantiles, and calculates coverage and size metrics.
+
+        Args:
+            val_dataloader (DataLoader): Dataloader for validation set.
+            group_index (int): Index of the group label in the input features.
+            
+        Returns:
+            dict: Dictionary containing evaluation metrics:
+                - coverage_rate: Empirical coverage rate on validation set
+                - average_size: Average size of prediction sets
+        """
+        import numpy as np
+        
+        if not hasattr(self, 'cal_scores'):
+            raise ValueError("Please calibrate first to get calibration scores.")
+        
+        # Collect validation data
+        val_features_list = []
+        val_labels_list = []
+        val_group_labels_list = []
+        
+        for batch in val_dataloader:
+            val_features_list.append(batch[0])
+            val_labels_list.append(batch[1])
+            val_group_labels_list.append(batch[0][:, group_index])
+        
+        val_features = torch.cat(val_features_list, dim=0)
+        val_labels = torch.cat(val_labels_list, dim=0)
+        val_group_labels = torch.cat(val_group_labels_list, dim=0).cpu().numpy()
+        
+        val_size = len(val_labels)
+        
+        # Compute group counts for calibration and validation sets
+        unique_groups = np.unique(np.concatenate([self.cal_group_labels, val_group_labels]))
+        cal_group_counts = {g: np.sum(self.cal_group_labels == g) for g in unique_groups}
+        val_group_counts = {g: np.sum(val_group_labels == g) for g in unique_groups}
+        
+        # Compute calibration weights: w_cal[i] = p_test(group_i) / p_cal(group_i)
+        w_calibration = np.zeros(len(self.cal_scores))
+        for i, group in enumerate(self.cal_group_labels):
+            p_cal = cal_group_counts[group] / self.cal_size
+            p_test = val_group_counts.get(group, 0) / val_size
+            w_calibration[i] = p_test / p_cal if p_cal > 0 else 0
+        
+        # Get predictions from model
+        val_features_np = val_features.cpu().numpy()
+        val_proba_np = self._model.predict_proba(val_features_np)
+        val_logits = torch.tensor(val_proba_np, dtype=torch.float32).to(self._device)
+        val_logits = self._logits_transformation(val_logits).detach()
+        
+        # Compute non-conformity scores for validation set
+        val_scores = self.score_function(val_logits, val_labels.to(self._device)).cpu().numpy()
+
+        print("Validation scores:", val_scores)
+        # Compute weighted quantiles for each validation sample based on its group
+        predictions_list = []
+        for i in range(val_size):
+            group = val_group_labels[i]
+            
+            # Compute w_test for this sample's group
+            p_cal = cal_group_counts[group] / self.cal_size
+            p_test = val_group_counts[group] / val_size
+            w_test = p_test / p_cal if p_cal > 0 else 1.0
+            
+            # Compute weighted quantile using the formula from the example
+            s = np.sum(w_calibration) + w_test
+            new_p = w_calibration / s
+            
+            # Sort calibration scores and corresponding weights
+            indices = np.argsort(self.cal_scores)
+            cal_scores_sorted = self.cal_scores[indices]
+            new_p_sorted = new_p[indices]
+            
+            # Find the weighted quantile
+            cumsum = np.cumsum(new_p_sorted)
+            quantile_idx = np.searchsorted(cumsum, 1.0 - self.alpha)
+            quantile_idx = min(quantile_idx, len(cal_scores_sorted) - 1)
+            q_value = cal_scores_sorted[quantile_idx]
+            
+            # Generate prediction set: include all classes where score <= quantile
+            q_value_tensor = torch.tensor(q_value, dtype=torch.float32).to(self._device)
+            pred_set = self.predict_with_logits(val_logits[i], q_value_tensor)
+            predictions_list.append(pred_set)
+        
+        val_predictions = torch.cat(predictions_list, dim=0)
+        
+        # Compute evaluation metrics
+        metrics = {
+            "coverage_rate": self._metric('coverage_rate')(val_predictions, val_labels.to(self._device)),
+            "average_size": self._metric('average_size')(val_predictions, val_labels.to(self._device))
+        }
+        
+        return metrics
+
+
