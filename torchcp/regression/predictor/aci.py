@@ -288,3 +288,162 @@ class ACIPredictor(SplitPredictor):
             "average_size": self._metric('average_size')(predicts)
         }
         return res_dict
+
+
+class XGBoostACIPredictor(ACIPredictor):
+    """
+    Adaptive Conformal Inference for XGBoost regressors.
+
+    This variant mirrors the logic of :class:`ACIPredictor` while replacing
+    torch-specific model calls (e.g., `.eval()` and forward passes) with
+    XGBoost's `predict` API. Tensor operations are retained where needed
+    to leverage existing score functions and metrics.
+
+    Args:
+        score_function (torchcp.regression.scores): A class that implements the score function.
+        model: An XGBoost regressor with a `.predict(np.ndarray)` method.
+        gamma (float): Step size parameter for adaptive adjustment of alpha. Must be > 0.
+        alpha (float, optional): The significance level. Default is 0.1.
+        device (torch.device | str, optional): Device for tensor ops (used for scores/metrics).
+    """
+
+    def __init__(self, score_function, model, gamma, alpha=0.1, device=None):
+        # Do not call parent's __init__ that assumes a torch model
+        SplitPredictor.__init__(self, score_function, model, alpha, device)
+        if (gamma is not None) and (gamma <= 0):
+            raise ValueError("gamma must be greater than 0.")
+
+        self.gamma = gamma
+        self.alpha_t = None
+        self.model_backbone = model  # keep for API parity
+        self.train_indicate = False
+
+    def _xgb_predict_to_tensor(self, x_tensor: torch.Tensor) -> torch.Tensor:
+        """Run XGBoost prediction on a tensor and return a float tensor on device."""
+        x_np = x_tensor.detach().cpu().numpy()
+        pred_np = self._model.predict(x_np)
+        return torch.tensor(pred_np, dtype=torch.float32, device=self._device)
+
+    def train(self, train_dataloader, **kwargs):
+        """
+        Calibrate on the training data and prepare ACI state.
+
+        For XGBoost models, we assume the model is pre-trained. This method
+        mirrors `ACIPredictor.train` behavior by performing calibration and
+        initializing `alpha_t`, without invoking any torch `.eval()`.
+        """
+        # Keep device consistent with potential kwargs
+        device = kwargs.pop('device', self._device)
+        self._device = device
+
+        # Calibrate with training data (same logic pathway as ACIPredictor)
+        self.calibrate(train_dataloader, self.alpha)
+        self.alpha_t = self.alpha
+        self.train_dataloader = train_dataloader
+        self.train_indicate = True
+
+    def calibrate(self, cal_dataloader, alpha=None):
+        if alpha is None:
+            alpha = self.alpha
+
+        x_list, predicts_list, y_truth_list = [], [], []
+        for tmp_x, tmp_labels in cal_dataloader:
+            # Keep tensors for score/metric pathways; no model .eval()/no_grad()
+            tmp_predicts = self._xgb_predict_to_tensor(tmp_x)
+            x_list.append(tmp_x)
+            predicts_list.append(tmp_predicts)
+            y_truth_list.append(tmp_labels)
+
+        predicts = torch.cat(predicts_list).float().to(self._device)
+        y_truth = torch.cat(y_truth_list).to(self._device)
+        x_batch = torch.cat(x_list).float().to(self._device)
+
+        if self.score_function.__class__.__name__ == 'NorABS':
+            self.scores = self.calculate_score(predicts, y_truth, x_batch)
+        else:
+            self.scores = self.calculate_score(predicts, y_truth)
+        self.q_hat = self._calculate_conformal_value(self.scores, alpha)
+
+    def predict(self, x_batch, x_lookback=None, y_lookback=None, pred_interval_lookback=None, train=False, update_alpha=True):
+        if self.train_indicate is False:
+            raise ValueError("The predict function must be called after the train function is called")
+
+        if (x_lookback is None) != (y_lookback is None):
+            raise ValueError("x_lookback, y_lookback must either be provided or be None.")
+
+        # For XGBoost, we do not toggle eval/no_grad; just compute predictions
+        if (x_lookback is not None) and (y_lookback is not None) and (pred_interval_lookback is None):
+            predicts_batch_lookback = self._xgb_predict_to_tensor(x_lookback)
+            pred_interval_lookback = self.generate_intervals(predicts_batch_lookback, self.q_hat)
+
+        # Optional retraining is not handled here for XGBoost (retain model)
+        if train is True:
+            warnings.warn(
+                "XGBoostACIPredictor does not perform in-method retraining; provided 'train=True' is ignored.",
+                UserWarning,
+            )
+
+        predicts_batch = self._xgb_predict_to_tensor(x_batch)
+
+        if (update_alpha is True) and (x_lookback is not None) and (y_lookback is not None):
+            return self.generate_aci_intervals(x_batch, x_lookback, y_lookback, pred_interval_lookback, predicts_batch)
+
+        return self.generate_intervals(predicts_batch, self.q_hat)
+
+    def generate_aci_intervals(self, x_batch, x_lookback, y_lookback, pred_interval_lookback, predicts_batch):
+        err_t = self.calculate_err_rate(x_batch, y_lookback, pred_interval_lookback, weight=True)
+
+        # Recompute scores with lookback predictions from XGBoost
+        lookback_predicts = self._xgb_predict_to_tensor(x_lookback)
+        self.scores = self.calculate_score(lookback_predicts.float(), y_lookback)
+
+        self.alpha_t = max(1/(self.scores.shape[0]+1), min(0.9999, self.alpha_t + self.gamma * (self.alpha - err_t)))
+        self.q_hat = self._calculate_conformal_value(self.scores, self.alpha_t)
+        return self.generate_intervals(predicts_batch, self.q_hat)
+
+    def evaluate(self, data_loader, lookback=200, retrain_gap=1, update_alpha_gap=1):
+        train_dataset = self.train_dataloader.dataset
+        if lookback > len(train_dataset):
+            raise ValueError("lookback cannot be set above the length of train_dataloader")
+
+        ts_dataloader = torch.utils.data.DataLoader(data_loader.dataset, batch_size=1, shuffle=False, pin_memory=True)
+        samples = [train_dataset[i] for i in range(len(train_dataset) - lookback, len(train_dataset))]
+
+        x_lookback = torch.stack([sample[0] for sample in samples]).to(self._device)
+        y_lookback = torch.stack([sample[1] for sample in samples]).to(self._device)
+        pred_interval_lookback = self.predict(x_lookback)
+
+        y_list, predict_list = [], []
+        for idx, (x, y) in enumerate(tqdm(ts_dataloader, desc="Processing Evaluation")):
+            x = x.to(self._device)
+            y = y.to(self._device)
+            if (retrain_gap != 0) and (idx % retrain_gap == 0) and (update_alpha_gap != 0) and (idx % update_alpha_gap == 0):
+                pred_interval = self.predict(x_batch=x, x_lookback=x_lookback, y_lookback=y_lookback,
+                                             pred_interval_lookback=pred_interval_lookback,
+                                             train=True, update_alpha=True)
+            elif (retrain_gap != 0) and (idx % retrain_gap == 0):
+                pred_interval = self.predict(x_batch=x, x_lookback=x_lookback, y_lookback=y_lookback,
+                                             pred_interval_lookback=pred_interval_lookback,
+                                             train=True, update_alpha=False)
+            elif (update_alpha_gap != 0) and (idx % update_alpha_gap == 0):
+                pred_interval = self.predict(x_batch=x, x_lookback=x_lookback, y_lookback=y_lookback,
+                                             pred_interval_lookback=pred_interval_lookback,
+                                             train=False, update_alpha=True)
+            else:
+                pred_interval = self.predict(x_batch=x, x_lookback=x_lookback, y_lookback=y_lookback,
+                                             pred_interval_lookback=pred_interval_lookback,
+                                             train=False, update_alpha=False)
+            y_list.append(y)
+            predict_list.append(pred_interval)
+            pred_interval_lookback = torch.cat([pred_interval_lookback, pred_interval], dim=0)[-lookback:]
+            x_lookback = torch.cat([x_lookback, x], dim=0)[-lookback:]
+            y_lookback = torch.cat([y_lookback, y], dim=0)[-lookback:]
+
+        predicts = torch.cat(predict_list, dim=0).to(self._device)
+        test_y = torch.cat(y_list).to(self._device)
+
+        res_dict = {
+            "coverage_rate": self._metric('coverage_rate')(predicts, test_y),
+            "average_size": self._metric('average_size')(predicts)
+        }
+        return res_dict

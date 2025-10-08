@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 #
 
-from .aci import ACIPredictor
+from .aci import ACIPredictor, XGBoostACIPredictor
 from .ensemble import EnsemblePredictor
 from .split import SplitPredictor
 from .agaci import AgACIPredictor
